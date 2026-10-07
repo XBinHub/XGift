@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ════════════════════════════════════════════════════════════════
 #   ✦ 𝐗 𝐆𝐈𝐅𝐓 ✦  —  Telegram Giveaway Bot  (Full Inline Admin)
-#   v3: Referral fix • Send Prize • User Info • Bot Commands Menu
+#   v4: Full User List w/ pagination • First names • Ref counters
 # ════════════════════════════════════════════════════════════════
 
 # ── SELF-HEALING: install anything missing BEFORE imports ──
@@ -24,6 +24,7 @@ import sqlite3
 import threading
 import datetime
 import html
+import math
 
 from telebot import TeleBot, types
 from telebot.types import BotCommand
@@ -32,6 +33,7 @@ from telebot.types import BotCommand
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 DB_PATH   = os.environ.get("DB_PATH", "xgift.db")
+PER_PAGE  = 10   # users per page in USER LIST
 
 bot = TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 BOT_USERNAME = ""
@@ -75,8 +77,9 @@ def q(sql, *params):
 def init_db():
     q("""CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY, username TEXT,
-            coins INTEGER DEFAULT 0, banned INTEGER DEFAULT 0,
-            last_daily TEXT, referrer INTEGER, join_date TEXT)""")
+            first_name TEXT, coins INTEGER DEFAULT 0,
+            banned INTEGER DEFAULT 0, last_daily TEXT,
+            referrer INTEGER, join_date TEXT, refs INTEGER DEFAULT 0)""")
     q("""CREATE TABLE IF NOT EXISTS channels(
             channel_id INTEGER PRIMARY KEY, title TEXT, username TEXT)""")
     q("""CREATE TABLE IF NOT EXISTS gifts(
@@ -87,9 +90,12 @@ def init_db():
             gift_id INTEGER, user_id INTEGER, PRIMARY KEY (gift_id, user_id))""")
     q("""CREATE TABLE IF NOT EXISTS chats(
             key TEXT PRIMARY KEY, chat_id INTEGER, title TEXT)""")
-    # migration for old databases
-    try: q("ALTER TABLE users ADD COLUMN join_date TEXT")
-    except Exception: pass
+    # migrations for old databases
+    for col, default in (("join_date", "TEXT"), ("first_name", "TEXT"), ("refs", "INTEGER DEFAULT 0")):
+        try:
+            q(f"ALTER TABLE users ADD COLUMN {col} {default}")
+        except Exception:
+            pass
 
 init_db()
 
@@ -107,15 +113,17 @@ def get_user_by_username(username):
     return q("SELECT * FROM users WHERE username=?",
              str(username).lower().lstrip("@")).fetchone()
 
-def ensure_user(uid, username):
+def ensure_user(uid, username, first_name=None):
     r = get_user(uid)
     if r:
         if username and r["username"] != username.lower():
             q("UPDATE users SET username=? WHERE user_id=?", username.lower(), uid)
-            r = get_user(uid)
-        return dict(r), False
-    q("INSERT INTO users(user_id, username, join_date) VALUES(?,?,?)",
-      uid, (username or "").lower(), datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        if first_name and r["first_name"] != first_name:
+            q("UPDATE users SET first_name=? WHERE user_id=?", first_name, uid)
+        return dict(get_user(uid)), False
+    q("INSERT INTO users(user_id, username, first_name, join_date) VALUES(?,?,?,?)",
+      uid, (username or "").lower(), (first_name or ""),
+      datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
     return dict(get_user(uid)), True
 
 def add_coins(uid, amount):
@@ -158,8 +166,9 @@ def user_panel_kb():
     return kb
 
 def user_text(u):
+    name = u.get("first_name") or u.get("username") or u["user_id"]
     return frame(f"\n  🎉 {bold('Welcome to X Gift!')} ✨\n") + \
-        f"\n{bold('➤ User:')}  {esc(u.get('username') or u['user_id'])}\n" \
+        f"\n{bold('➤ User:')}  {esc(name)}\n" \
         f"{bold('➤ Coins:')}  🔷 {bold(u['coins'])}\n\n" \
         f"{fancy('Join giveaways • Earn coins • Win prizes!')} 🍀"
 
@@ -304,7 +313,7 @@ def cb_delg(c):
     except Exception:
         pass
 
-# ───────────────── 📦 SEND PRIZE (NEW!) ─────────────────
+# ───────────────── 📦 SEND PRIZE ─────────────────
 @bot.callback_query_handler(func=lambda c: c.data == "ap_prize")
 def cb_prize(c):
     if not guard(c): return
@@ -429,7 +438,7 @@ def cb_users(c):
     )
     kb.add(
         types.InlineKeyboardButton(f"🔍 {bold('USER INFO')}",    callback_data="us_info"),
-        types.InlineKeyboardButton(f"📋 {bold('USER LIST')}",    callback_data="us_list"),
+        types.InlineKeyboardButton(f"📋 {bold('USER LIST')}",    callback_data="us_list_0"),
     )
     kb.add(types.InlineKeyboardButton(f"🔙 {bold('BACK TO PANEL')}", callback_data="ap"))
     bot.answer_callback_query(c.id)
@@ -458,24 +467,54 @@ def cb_user_action(c):
     bot.edit_message_text(frame(f"\n {title}\n") + f"\n{hint}\n",
         c.message.chat.id, c.message.message_id, reply_markup=cancel_kb())
 
-@bot.callback_query_handler(func=lambda c: c.data == "us_list")
+# ═══════════ 📋 FULL USER LIST WITH PAGINATION ═══════════
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("us_list_"))
 def cb_user_list(c):
     if not guard(c): return
-    bot.answer_callback_query(c.id)
-    users = q("SELECT * FROM users ORDER BY coins DESC LIMIT 30").fetchall()
-    txt = frame(f"\n 📋 {bold('TOP USERS')} ({ital('by coins')})\n") + "\n"
-    if not users:
+    page = int(c.data.split("_")[2])
+    total = q("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    pages = max(1, math.ceil(total / PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = q("SELECT * FROM users ORDER BY user_id LIMIT ? OFFSET ?",
+             PER_PAGE, page * PER_PAGE).fetchall()
+
+    txt = frame(f"\n 📋 {bold('ALL USERS')}\n") + \
+        f"\n👤 {bold('Total:')} {bold(total)}  |  📄 {bold('Page:')} {bold(page + 1)}/{bold(pages)}\n" + \
+        "─────────────────────\n"
+    if not rows:
         txt += f"{ital('No users yet.')}"
-    for i, u in enumerate(users, 1):
-        flag = "🚫" if u["banned"] else "✅"
-        txt += (f"{bold(i)}. {flag} {esc(u['username'] or u['user_id'])}\n"
-                f"      🆔 {mono(u['user_id'])} | 💎 {bold(u['coins'])}\n")
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton(f"🔙 {bold('BACK')}", callback_data="ap_users"))
+    for i, u in enumerate(rows, start=page * PER_PAGE + 1):
+        status = "🚫" if u["banned"] else "✅"
+        name = u["first_name"] or "—"
+        uname = f"@{u['username']}" if u["username"] else ital("no username")
+        jdate = u["join_date"] or "—"
+        txt += (
+            f"\n{bold(f'{i}:')} {status} 👤 {bold(esc(name))}\n"
+            f"     📛 {esc(uname)}\n"
+            f"     🆔 {mono(u['user_id'])}\n"
+            f"     💎 {bold(u['coins'])}  |  👥 {bold(u['refs'] or 0)} refs\n"
+            f"     📅 {esc(jdate)}\n"
+        )
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton(f"⬅️ {bold('PREV')}",
+                    callback_data=f"us_list_{page - 1}"))
+    else:
+        nav.append(types.InlineKeyboardButton("➖", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(types.InlineKeyboardButton(f"{bold('NEXT')} ➡️",
+                    callback_data=f"us_list_{page + 1}"))
+    else:
+        nav.append(types.InlineKeyboardButton("➖", callback_data="noop"))
+    kb.row(*nav)
+    kb.add(types.InlineKeyboardButton(f"🔙 {bold('BACK TO USERS')}", callback_data="ap_users"))
+    bot.answer_callback_query(c.id)
     try:
-        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=kb)
+        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id,
+                              reply_markup=kb, disable_web_page_preview=True)
     except Exception:
-        bot.send_message(c.from_user.id, txt, reply_markup=kb)
+        bot.send_message(c.from_user.id, txt, reply_markup=kb, disable_web_page_preview=True)
 
 def resolve_user(text):
     t = text.strip()
@@ -486,23 +525,21 @@ def resolve_user(text):
     return None
 
 def user_profile_text(u):
-    refs = q("SELECT COUNT(*) c FROM users WHERE referrer=? AND 0", u["user_id"]).fetchone()["c"]
-    # referrer is cleared after reward; count referrals from rewards log via referrer history:
-    # simpler: count users whose current referrer is them (pending) + past is unknown, so show pending:
     pend = q("SELECT COUNT(*) c FROM users WHERE referrer=?", u["user_id"]).fetchone()["c"]
     gcount = q("SELECT COUNT(*) c FROM entries WHERE user_id=?", u["user_id"]).fetchone()["c"]
-    won = q("SELECT COUNT(*) c FROM gifts WHERE active=0 AND 0", u["user_id"]).fetchone()["c"]
+    name = u["first_name"] or "—"
     uname = f"@{u['username']}" if u["username"] else ital("no username")
     return frame(f"\n 🔍 {bold('USER PROFILE')}\n") + \
-        f"\n👤 {bold('Username:')}  {esc(uname)}\n" \
+        f"\n👤 {bold('Name:')}  {bold(esc(name))}\n" \
+        f"📛 {bold('Username:')}  {esc(uname)}\n" \
         f"🆔 {bold('ID:')}  {mono(u['user_id'])}\n" \
         f"📅 {bold('Joined:')}  {bold(u['join_date'] or 'unknown')}\n" \
         f"💎 {bold('Coins:')}  🔷 {bold(u['coins'])}\n" \
         f"{'🚫' if u['banned'] else '✅'} {bold('Status:')}  {bold('BANNED') if u['banned'] else bold('Active')}\n" \
         f"🎯 {bold('Last daily:')}  {bold(u['last_daily'] or 'never')}\n" \
+        f"👥 {bold('Successful referrals:')}  👤 {bold(u['refs'] or 0)}\n" \
         f"⏳ {bold('Pending referrals:')}  👤 {bold(pend)}\n" \
-        f"🎟 {bold('Gift entries:')}  {bold(gcount)}\n" \
-        f"👥 {bold('Referral link uses:')} {ital('tracked on join')}"
+        f"🎟 {bold('Gift entries:')}  {bold(gcount)}"
 
 # ───────────────── 📣 BROADCAST ─────────────────
 @bot.callback_query_handler(func=lambda c: c.data == "ap_bc")
@@ -561,6 +598,7 @@ def cb_stats(c):
     gifts  = q("SELECT COUNT(*) c FROM gifts WHERE active=1").fetchone()["c"]
     coins  = q("SELECT COALESCE(SUM(coins),0) c FROM users").fetchone()["c"]
     entries= q("SELECT COUNT(*) c FROM entries").fetchone()["c"]
+    refs   = q("SELECT COALESCE(SUM(refs),0) c FROM users").fetchone()["c"]
     bot.answer_callback_query(c.id)
     bot.edit_message_text(
         frame(f"\n 📊 {bold('LIVE STATISTICS')}\n") +
@@ -568,6 +606,7 @@ def cb_stats(c):
         f"🚫 {bold('Banned:')}       {bold(banned)}\n"
         f"🎁 {bold('Active gifts:')} {bold(gifts)}\n"
         f"🎟 {bold('Total entries:')} {bold(entries)}\n"
+        f"👥 {bold('Total referrals:')} {bold(refs)}\n"
         f"💎 {bold('Coins in circulation:')} 🔷 {bold(coins)}\n",
         c.message.chat.id, c.message.message_id, reply_markup=back_kb())
 
@@ -581,7 +620,6 @@ def admin_state(m):
     st = STATES[m.from_user.id]
     step, data = st["step"], st.get("data", {})
 
-    # ── Gift creation ──
     if step == "ng_title":
         if not m.text: return
         data["title"] = m.text.strip()
@@ -616,10 +654,9 @@ def admin_state(m):
             f"💰 Cost: 🔷 {bold(data['cost'])}\n⏰ Duration: {bold(data['hours'])} hours\n\n"
             f"📢 {ital('Posted to channel & group!')}",
             reply_markup=back_kb())
-        post_gift(gid)   # ← posts to BOTH channel & group
+        post_gift(gid)
         return
 
-    # ── Force-join add ──
     if step == "fj_add":
         chat = _resolve_chat(m)
         if not chat or chat.type not in ("channel", "group", "supergroup"):
@@ -634,7 +671,6 @@ def admin_state(m):
             f"{ital('All users must join before participating!')} 🔒",
             reply_markup=back_kb())
 
-    # ── Announce targets ──
     if step in ("set_chan", "set_grp"):
         chat = _resolve_chat(m)
         if not chat or chat.type not in ("channel", "group", "supergroup"):
@@ -648,7 +684,6 @@ def admin_state(m):
             f"\n📢 {bold(esc(chat.title or chat.id))}\n🆔 {mono(chat.id)}",
             reply_markup=back_kb())
 
-    # ── Ban / Unban ──
     if step in ("ban_wait", "unban_wait"):
         if not m.text: return
         u = resolve_user(m.text)
@@ -661,11 +696,10 @@ def admin_state(m):
         STATES.pop(m.from_user.id)
         return bot.reply_to(m,
             frame(f"\n {'🔨 BANNED' if banning else '🕊 UNBANNED'}\n") +
-            f"\n👤 {bold(esc(u['username'] or u['user_id']))}\n"
+            f"\n👤 {bold(esc(u['first_name'] or u['username'] or u['user_id']))}\n"
             f"🆔 {mono(u['user_id'])}",
             reply_markup=back_kb())
 
-    # ── Coins ──
     if step == "coins_wait":
         if not m.text: return
         parts = m.text.split()
@@ -680,12 +714,12 @@ def admin_state(m):
         STATES.pop(m.from_user.id)
         return bot.reply_to(m,
             frame(f"\n 💎 {bold('COINS UPDATED')}\n") +
-            f"\n👤 {bold(esc(u['username'] or u['user_id']))}\n"
+            f"\n👤 {bold(esc(u['first_name'] or u['username'] or u['user_id']))}\n"
+            f"🆔 {mono(u['user_id'])}\n"
             f"{'➕' if amount >= 0 else '➖'} Amount: 🔷 {bold(abs(amount))}\n"
             f"💎 New balance: 🔷 {bold(get_user(u['user_id'])['coins'])}",
             reply_markup=back_kb())
 
-    # ── User info (NEW!) ──
     if step == "info_wait":
         if not m.text: return
         u = resolve_user(m.text)
@@ -694,7 +728,6 @@ def admin_state(m):
         STATES.pop(m.from_user.id)
         return bot.reply_to(m, user_profile_text(dict(u)), reply_markup=back_kb())
 
-    # ── Send Prize: STEP 1 — target (NEW!) ──
     if step == "prize_target":
         if not m.text: return
         u = resolve_user(m.text)
@@ -704,13 +737,12 @@ def admin_state(m):
         st["data"] = {"target": u["user_id"]}
         return bot.reply_to(m,
             frame(f"\n 📦 {bold('SEND PRIZE')} — {bold('STEP 2/2')}\n") +
-            f"\n👤 {bold('Target:')} {esc(u['username'] or u['user_id'])} "
+            f"\n👤 {bold('Target:')} {esc(u['first_name'] or u['username'] or u['user_id'])} "
             f"({mono(u['user_id'])})\n\n"
             f"{bold('➤ Now send the prize content:')}\n"
             f"{ital('text • photo • photo+caption • file • video • anything!')} 🎁",
             reply_markup=cancel_kb())
 
-    # ── Send Prize: STEP 2 — content (NEW!) ──
     if step == "prize_content":
         target = st.get("data", {}).get("target")
         if not target:
@@ -737,7 +769,6 @@ def admin_state(m):
                 f"❌ {bold('Could not deliver!')} {ital('User may have blocked the bot.')}",
                 reply_markup=back_kb())
 
-    # ── Broadcast preview ──
     if step == "bc_wait":
         STATES[m.from_user.id] = {"step": "bc_confirm",
                                   "data": {"chat_id": m.chat.id, "msg_id": m.message_id}}
@@ -758,7 +789,8 @@ def admin_state(m):
 def cmd_start(m):
     global BOT_USERNAME
     if not m.from_user: return
-    u, created = ensure_user(m.from_user.id, m.from_user.username)
+    u, created = ensure_user(m.from_user.id, m.from_user.username,
+                             getattr(m.from_user, "first_name", None))
     if u["banned"]:
         return bot.reply_to(m, frame(f"\n 🚫 {bold('YOU ARE BANNED!')}"))
 
@@ -793,6 +825,7 @@ def maybe_reward_referral(uid):
     if not referrer or referrer["banned"]: return False
     add_coins(uid, 1)
     add_coins(referrer["user_id"], 3)
+    q("UPDATE users SET refs = COALESCE(refs,0) + 1 WHERE user_id=?", referrer["user_id"])
     q("UPDATE users SET referrer=NULL WHERE user_id=?", uid)
     try:
         bot.send_message(uid,
@@ -822,7 +855,7 @@ def cb_recheck(c):
 
 @bot.callback_query_handler(func=lambda c: c.data == "noop")
 def cb_noop(c):
-    bot.answer_callback_query(c.id, "⚠️ No link available — ask admin!")
+    bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data == "balance")
 def cb_balance(c):
@@ -857,7 +890,7 @@ def cb_ref(c):
     u = get_user(c.from_user.id)
     if u and u["banned"]:
         return bot.answer_callback_query(c.id, "🚫 You are banned!")
-    count = q("SELECT COUNT(*) c FROM users WHERE referrer=?", c.from_user.id).fetchone()["c"]
+    count = q("SELECT COALESCE(refs,0) c FROM users WHERE user_id=?", c.from_user.id).fetchone()["c"]
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{c.from_user.id}"
     share = f"https://t.me/share/url?url={link}&text=Join%20X%20Gift%20and%20win%20prizes!%20%F0%9F%8E%81"
     kb = types.InlineKeyboardMarkup(row_width=1)
@@ -866,7 +899,7 @@ def cb_ref(c):
     bot.answer_callback_query(c.id)
     bot.send_message(c.from_user.id,
         frame(f"\n 👥 {bold('REFERRAL SYSTEM')}\n") +
-        f"\n{bold('➤ Invited users:')}  👤 {bold(count)}\n"
+        f"\n{bold('➤ Successful referrals:')}  👤 {bold(count)}\n"
         f"{bold('➤ Per referral:')}  🔷 {bold('+1')} you / 🔷 {bold('+3')} inviter\n\n"
         f"{ital('Your personal link:')} 👇\n"
         f"{link}\n\n"
@@ -976,7 +1009,6 @@ def finish_gift(g):
                    else f'<a href="tg://user?id={winner["user_id"]}">User</a>')
         body += (f"\n🏆 {bold('WINNER:')}  👑 {mention}\n\n"
                  f"🎊 {bold('Congratulations!')} Contact the admins to claim your prize! 🎊")
-        # ── winner DM: announce + "prize info coming soon" ──
         try:
             bot.send_message(winner["user_id"],
                 frame(f"\n 🏆 {bold('YOU WON!')} 🏆\n") +
