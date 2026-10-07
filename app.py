@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 # ════════════════════════════════════════════════════════════════
 #   ✦ 𝐗 𝐆𝐈𝐅𝐓 ✦  —  Telegram Giveaway Bot  (Full Inline Admin)
-#   Railway Ready • All-Buttons Admin Panel • Fancy Fonts
 # ════════════════════════════════════════════════════════════════
+import subprocess, sys
+
+def _ensure(pkg):
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"📦 Installing {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+_ensure("aiohttp")
+
 import os
 import re
 import time
@@ -14,6 +24,8 @@ import html
 
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
+
+# ... بقیه‌ی کد دقیقاً همون قبلیه، دست نزن
 
 # ────────────────────────── CONFIG ──────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
