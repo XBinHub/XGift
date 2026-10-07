@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+# ════════════════════════════════════════════════════════════════
+#   ✦ 𝐗 𝐆𝐈𝐅𝐓 ✦  —  Telegram Giveaway Bot  (Full Inline Admin)
+#   Railway Ready • All-Buttons Admin Panel • Fancy Fonts
+# ════════════════════════════════════════════════════════════════
+import os
+import re
+import time
+import random
+import sqlite3
+import asyncio
+import datetime
+import html
+
+from telebot.async_telebot import AsyncTeleBot
+from telebot import types
+
+# ────────────────────────── CONFIG ──────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+DB_PATH   = os.environ.get("DB_PATH", "xgift.db")
+
+bot = AsyncTeleBot(BOT_TOKEN, parse_mode="HTML")
+BOT_USERNAME = ""
+
+# ────────────────────── FANCY FONTS ─────────────────────────────
+def _fontmap(up, low=None, dig=None):
+    m = {ord('A') + i: chr(up + i) for i in range(26)}
+    if low is not None:
+        m.update({ord('a') + i: chr(low + i) for i in range(26)})
+    if dig is not None:
+        m.update({ord('0') + i: chr(dig + i) for i in range(10)})
+    return m
+
+_B  = _fontmap(0x1D400, 0x1D41A, 0x1D7CE)   # 𝐁𝐨𝐥𝐝
+_M  = _fontmap(0x1D670, 0x1D6AA, 0x1D7F6)   # 𝙼𝚘𝚗𝚘
+_BS = _fontmap(0x1D4D0, 0x1D4EA)            # 𝓑𝓸𝓵𝓭 𝓢𝓬𝓻𝓲𝓹𝓽
+
+def bold(t):  return str(t).translate(_B)
+def mono(t):  return str(t).translate(_M)
+def fancy(t): return str(t).translate(_BS)
+def esc(t):   return html.escape(str(t))
+
+def frame(title_txt):
+    return (f"╔═════「 ✦ {bold('X GIFT')} ✦ 」═════╗\n"
+            f"{title_txt}\n"
+            f"╚═════════════════════════╝")
+
+# ────────────────────────── DATABASE ────────────────────────────
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+
+def q(sql, *params):
+    cur = db.execute(sql, params)
+    db.commit()
+    return cur
+
+def init_db():
+    q("""CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY, username TEXT,
+            coins INTEGER DEFAULT 0, banned INTEGER DEFAULT 0,
+            last_daily TEXT, referrer INTEGER)""")
+    q("""CREATE TABLE IF NOT EXISTS channels(
+            channel_id INTEGER PRIMARY KEY, title TEXT, username TEXT)""")
+    q("""CREATE TABLE IF NOT EXISTS gifts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
+            cost INTEGER, hours INTEGER, end_time INTEGER,
+            active INTEGER DEFAULT 1, chan_msg_id INTEGER, grp_msg_id INTEGER)""")
+    q("""CREATE TABLE IF NOT EXISTS entries(
+            gift_id INTEGER, user_id INTEGER, PRIMARY KEY (gift_id, user_id))""")
+    q("""CREATE TABLE IF NOT EXISTS chats(
+            key TEXT PRIMARY KEY, chat_id INTEGER, title TEXT)""")
+
+init_db()
+
+def get_chat(key):
+    r = q("SELECT * FROM chats WHERE key=?", key).fetchone()
+    return dict(r) if r else None
+
+def set_chat(key, chat_id, title):
+    q("INSERT OR REPLACE INTO chats(key, chat_id, title) VALUES(?,?,?)", key, chat_id, title)
+
+def is_admin(uid): return uid in ADMIN_IDS
+
+def get_user(uid): return q("SELECT * FROM users WHERE user_id=?", uid).fetchone()
+
+def get_user_by_username(username):
+    return q("SELECT * FROM users WHERE username=?",
+             str(username).lower().lstrip("@")).fetchone()
+
+def ensure_user(uid, username):
+    r = get_user(uid)
+    if r:
+        if username and r["username"] != username.lower():
+            q("UPDATE users SET username=? WHERE user_id=?", username.lower(), uid)
+            r = get_user(uid)
+        return dict(r), False
+    q("INSERT INTO users(user_id, username) VALUES(?,?)", uid, (username or "").lower())
+    return dict(get_user(uid)), True
+
+def add_coins(uid, amount):
+    q("UPDATE users SET coins = coins + ? WHERE user_id=?", amount, uid)
+
+# ─────────────────── FORCE-JOIN SYSTEM ──────────────────────────
+async def missing_channels(uid):
+    out = []
+    for ch in q("SELECT * FROM channels").fetchall():
+        try:
+            m = await bot.get_chat_member(ch["channel_id"], uid)
+            if m.status not in ("member", "administrator", "creator"):
+                out.append(dict(ch))
+        except Exception:
+            out.append(dict(ch))
+    return out
+
+def join_kb(missing):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ch in missing:
+        if ch.get("username"):
+            kb.add(types.InlineKeyboardButton(f"🔗 {ch['title']}",
+                    url=f"https://t.me/{ch['username']}"))
+        else:
+            kb.add(types.InlineKeyboardButton(f"🔗 {ch['title']}", callback_data="noop"))
+    kb.add(types.InlineKeyboardButton(f"✅ {bold('I JOINED')}", callback_data="recheck"))
+    return kb
+
+# ─────────────────────── USER KEYBOARD ──────────────────────────
+def user_panel_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(f"🎁 {bold('GIFTS')}",   callback_data="gifts_list"),
+        types.InlineKeyboardButton(f"💎 {bold('BALANCE')}", callback_data="balance"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(f"🎯 {bold('DAILY')}",   callback_data="daily"),
+        types.InlineKeyboardButton(f"👥 {bold('REFERRALS')}", callback_data="ref"),
+    )
+    return kb
+
+def user_text(u):
+    return frame(f"\n  🎉 {bold('Welcome to X Gift!')} ✨\n") + \
+        f"\n{bold('➤ User:')}  {esc(u.get('username') or u['user_id'])}\n" \
+        f"{bold('➤ Coins:')}  🔷 {bold(u['coins'])}\n\n" \
+        f"{fancy('Join giveaways • Earn coins • Win prizes!')} 🍀"
+
+# ════════════════════════════════════════════════════════════════
+#                        ADMIN PANEL (ALL BUTTONS)
+# ════════════════════════════════════════════════════════════════
+STATES = {}   # admin_id -> {"step": ..., "data": {...}}
+
+def back_kb(target="ap"):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(f"🔙 {bold('BACK TO PANEL')}", callback_data=target))
+    return kb
+
+def cancel_kb():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(f"❌ {bold('CANCEL')}", callback_data="cancel"))
+    return kb
+
+def admin_panel_kb():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(f"🎁 {bold('CREATE GIFT')}",  callback_data="ap_newgift"),
+        types.InlineKeyboardButton(f"🗂 {bold('MANAGE GIFTS')}", callback_data="ap_gifts"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(f"👥 {bold('USERS')}",        callback_data="ap_users"),
+        types.InlineKeyboardButton(f"📢 {bold('FORCE JOIN')}",   callback_data="ap_fj"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(f"📌 {bold('ANNOUNCEMENTS')}", callback_data="ap_ann"),
+        types.InlineKeyboardButton(f"📣 {bold('BROADCAST')}",    callback_data="ap_bc"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(f"📊 {bold('STATS')}",        callback_data="ap_stats"),
+        types.InlineKeyboardButton(f"♻️ {bold('REFRESH')}",      callback_data="ap"),
+    )
+    return kb
+
+def admin_panel_text():
+    admins_gifts = q("SELECT COUNT(*) c FROM gifts WHERE active=1").fetchone()["c"]
+    users = q("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    return frame(f"\n  🛡 {bold('ADMIN CONTROL PANEL')}\n") + \
+        f"\n👤 {bold('Users:')} {bold(users)}   |   🎁 {bold('Active Gifts:')} {bold(admins_gifts)}\n\n" \
+        f"{fancy('Choose an option below, boss!')} 👑"
+
+# ───────────────── PANEL ENTRY ─────────────────
+@bot.message_handler(commands=["admin"])
+async def cmd_admin(m):
+    if not is_admin(m.from_user.id): return
+    STATES.pop(m.from_user.id, None)
+    await bot.reply_to(m, admin_panel_text(), reply_markup=admin_panel_kb())
+
+def guard(c):
+    """returns True if admin, else answers alert"""
+    if is_admin(c.from_user.id):
+        return True
+    asyncio.ensure_future(bot.answer_callback_query(c.id, "🚫 Admins only!", show_alert=True))
+    return False
+
+@bot.callback_query_handler(func=lambda c: c.data == "ap")
+async def cb_panel(c):
+    if not guard(c): return
+    STATES.pop(c.from_user.id, None)
+    await bot.answer_callback_query(c.id)
+    try:
+        await bot.edit_message_text(admin_panel_text(), c.message.chat.id,
+                                    c.message.message_id, reply_markup=admin_panel_kb())
+    except Exception:
+        await bot.send_message(c.from_user.id, admin_panel_text(), reply_markup=admin_panel_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data == "cancel")
+async def cb_cancel(c):
+    if not guard(c): return
+    STATES.pop(c.from_user.id, None)
+    await bot.answer_callback_query(c.id, "❌ Cancelled")
+    try:
+        await bot.edit_message_text(admin_panel_text(), c.message.chat.id,
+                                    c.message.message_id, reply_markup=admin_panel_kb())
+    except Exception:
+        pass
+
+# ───────────────── 🎁 GIFT CREATION (BUTTON FLOW) ─────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "ap_newgift")
+async def cb_newgift(c):
+    if not guard(c): return
+    STATES[c.from_user.id] = {"step": "ng_title", "data": {}}
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(
+        frame(f"\n 🎁 {bold('CREATE NEW GIFT')} — {bold('STEP 1/3')}\n") +
+        f"\n{bold('➤ Send the gift title now:')}\n"
+        f"{ital('e.g:')} {mono('Surfshark 1 Month Account')}\n",
+        c.message.chat.id, c.message.message_id, reply_markup=cancel_kb())
+
+# ───────────────── 🗂 MANAGE GIFTS ─────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "ap_gifts")
+async def cb_gifts_mgr(c):
+    if not guard(c): return
+    gifts = q("SELECT * FROM gifts WHERE active=1 ORDER BY end_time").fetchall()
+    await bot.answer_callback_query(c.id)
+    if not gifts:
+        return await bot.edit_message_text(
+            frame(f"\n 🗂 {bold('MANAGE GIFTS')}\n") + f"\n📭 {bold('No active giveaways.')}",
+            c.message.chat.id, c.message.message_id, reply_markup=back_kb())
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    txt = frame(f"\n 🗂 {bold('MANAGE GIFTS')}\n") + "\n"
+    for g in gifts:
+        left = max(0, int((g["end_time"] - time.time()) // 3600))
+        joined = q("SELECT COUNT(*) c FROM entries WHERE gift_id=?", g["id"]).fetchone()["c"]
+        txt += (f"\n🆔 {mono(g['id'])} | 🎁 {bold(esc(g['title']))}\n"
+                f"   💰 🔷{bold(g['cost'])} | ⏰ {bold(left)}h | 👥 {bold(joined)}\n")
+        kb.add(types.InlineKeyboardButton(
+            f"🏁 {bold('END NOW')}  #{g['id']} — {g['title'][:18]}",
+            callback_data=f"endg_{g['id']}"))
+        kb.add(types.InlineKeyboardButton(
+            f"🗑 {bold('DELETE')}  #{g['id']}",
+            callback_data=f"delg_{g['id']}"))
+    kb.add(types.InlineKeyboardButton(f"🔙 {bold('BACK TO PANEL')}", callback_data="ap"))
+    await bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("endg_"))
+async def cb_endg(c):
+    if not guard(c): return
+    gid = int(c.data.split("_")[1])
+    g = q("SELECT * FROM gifts WHERE id=? AND active=1", gid).fetchone()
+    if not g:
+        return await bot.answer_callback_query(c.id, "❌ Already finished!", show_alert=True)
+    await bot.answer_callback_query(c.id, "🏁 Ending & picking winner...")
+    await finish_gift(dict(g))
+    await bot.send_message(c.from_user.id,
+        frame(f"\n 🏁 {bold('GIFT ENDED BY ADMIN')}\n") +
+        f"\n🎁 {bold(esc(g['title']))}\n🏆 {ital('Winner announced publicly!')}",
+        reply_markup=back_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("delg_"))
+async def cb_delg(c):
+    if not guard(c): return
+    gid = int(c.data.split("_")[1])
+    q("DELETE FROM gifts WHERE id=?", gid)
+    q("DELETE FROM entries WHERE gift_id=?", gid)
+    await bot.answer_callback_query(c.id, "🗑 Gift deleted!")
+    await cb_gifts_mgr(c)   # refresh list
+
+# ───────────────── 📢 FORCE JOIN (BUTTONS) ─────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "ap_fj")
+async def cb_fj(c):
+    if not guard(c): return
+    chans = q("SELECT * FROM channels").fetchall()
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    txt = frame(f"\n 📢 {bold('FORCE JOIN MANAGEMENT')}\n")
+    if chans:
+        txt += f"\n{bold('➤ Current required channels:')}\n"
+        for ch in chans:
+            txt += f"   • {bold(esc(ch['title']))}\n"
+            kb.add(types.InlineKeyboardButton(
+                f"🗑 {bold('REMOVE')}  {ch['title'][:26]}",
+                callback_data=f"delch_{ch['channel_id']}"))
+    else:
+        txt += f"\n{ital('No channels added yet.')}\n"
+    kb.add(types.InlineKeyboardButton(f"➕ {bold('ADD CHANNEL')}", callback_data="fj_add"))
+    kb.add(types.InlineKeyboardButton(f"🔙 {bold('BACK TO PANEL')}", callback_data="ap"))
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data == "fj_add")
+async def cb_fj_add(c):
+    if not guard(c): return
+    STATES[c.from_user.id] = {"step": "fj_add"}
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(
+        frame(f"\n ➕ {bold('ADD FORCE-JOIN CHANNEL')}\n") +
+        f"\n{bold('➤ Now FORWARD any post')} from the channel here,\n"
+        f"{ital('or send its @username / numeric ID:')}\n"
+        f"{ital('e.g:')} {mono('@mychannel')} {ital('or')} {mono('-1001234567890')}\n",
+        c.message.chat.id, c.message.message_id, reply_markup=cancel_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("delch_"))
+async def cb_delch(c):
+    if not guard(c): return
+    q("DELETE FROM channels WHERE channel_id=?", int(c.data.split("_")[1]))
+    await bot.answer_callback_query(c.id, "🗑 Removed!")
+    await cb_fj(c)
+
+# ───────────────── 📌 ANNOUNCE TARGETS (BUTTONS) ─────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "ap_ann")
+async def cb_ann(c):
+    if not guard(c): return
+    chan, grp = get_chat("announce_channel"), get_chat("announce_group")
+    txt = frame(f"\n 📌 {bold('ANNOUNCEMENT TARGETS')}\n") + \
+        f"\n📢 {bold('Channel:')}  {bold(esc(chan['title'])) if chan else ital('not set ❌')}\n" \
+        f"👥 {bold('Group:')}    {bold(esc(grp['title'])) if grp else ital('not set ❌')}\n\n" \
+        f"{ital('Winner announcements are posted here & pinned in group!')} 🏆"
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton(f"📢 {bold('SET CHANNEL')}", callback_data="set_chan"))
+    kb.add(types.InlineKeyboardButton(f"👥 {bold('SET GROUP')}",   callback_data="set_grp"))
+    if chan:
+        kb.add(types.InlineKeyboardButton(f"🗑 {bold('CLEAR CHANNEL')}", callback_data="clr_chan"))
+    if grp:
+        kb.add(types.InlineKeyboardButton(f"🗑 {bold('CLEAR GROUP')}", callback_data="clr_grp"))
+    kb.add(types.InlineKeyboardButton(f"🔙 {bold('BACK TO PANEL')}", callback_data="ap"))
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+async def _set_announce(m, key, label):
+    """resolve chat from forward or @name/id, save, confirm"""
+    chat = None
+    if m.forward_from_chat:
+        chat = m.forward_from_chat
+    elif m.text and m.text.strip():
+        ref = m.text.strip()
+        try:
+            chat = await bot.get_chat(ref)
+        except Exception:
+            chat = None
+    if not chat or chat.type not in ("channel", "group", "supergroup"):
+        await bot.reply_to(m, f"❌ {bold('Cannot access that chat!')}\n"
+                              f"{ital('Make sure the bot is inside it, then try again.')}")
+        return
+    set_chat(key, chat.id, chat.title or str(chat.id))
+    STATES.pop(m.from_user.id, None)
+    await bot.reply_to(m,
+        frame(f"\n ✅ {bold(label + ' SET')}\n") +
+        f"\n📢 {bold(esc(chat.title or chat.id))}\n🆔 {mono(chat.id)}",
+        reply_markup=back_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data in ("set_chan", "set_grp"))
+async def cb_set_ann(c):
+    if not guard(c): return
+    is_chan = c.data == "set_chan"
+    STATES[c.from_user.id] = {"step": "set_chan" if is_chan else "set_grp"}
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(
+        frame(f"\n 📌 {bold('SET ' + ('CHANNEL' if is_chan else 'GROUP'))}\n") +
+        f"\n{bold('➤ FORWARD any post')} from the {'channel' if is_chan else 'group'} here,\n"
+        f"{ital('or send its @username / ID:')}\n",
+        c.message.chat.id, c.message.message_id, reply_markup=cancel_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data in ("clr_chan", "clr_grp"))
+async def cb_clr_ann(c):
+    if not guard(c): return
+    q("DELETE FROM chats WHERE key=?", "announce_channel" if c.data == "clr_chan" else "announce_group")
+    await bot.answer_callback_query(c.id, "🗑 Cleared!")
+    await cb_ann(c)
+
+# ───────────────── 👥 USER MANAGEMENT (BUTTONS) ─────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "ap_users")
+async def cb_users(c):
+    if not guard(c): return
+    users = q("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    banned = q("SELECT COUNT(*) c FROM users WHERE banned=1").fetchone()["c"]
+    txt = frame(f"\n 👥 {bold('USER MANAGEMENT')}\n") + \
+        f"\n👤 {bold('Total users:')} {bold(users)}\n🚫 {bold('Banned:')} {bold(banned)}\n\n" \
+        f"{fancy('Pick an action below:')} ⚡️"
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(f"🔨 {bold('BAN USER')}",     callback_data="us_ban"),
+        types.InlineKeyboardButton(f"🕊 {bold('UNBAN USER')}",   callback_data="us_unban"),
+    )
+    kb.add(
+        types.InlineKeyboardButton(f"➕ {bold('ADD COINS')}",    callback_data="us_coins_add"),
+        types.InlineKeyboardButton(f"➖ {bold('REMOVE COINS')}", callback_data="us_coins_rem"),
+    )
+    kb.add(types.InlineKeyboardButton(f"🔙 {bold('BACK TO PANEL')}", callback_data="ap"))
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+def _ask_target(step, title, hint):
+    def deco(fn):
+        return fn
+    return deco
+
+@bot.callback_query_handler(func=lambda c: c.data in ("us_ban", "us_unban",
+                                                       "us_coins_add", "us_coins_rem"))
+async def cb_user_action(c):
+    if not guard(c): return
+    mapping = {
+        "us_ban":       ("ban_wait",      "🔨 BAN USER",
+                         f"{bold('➤ Send the user:')} {mono('@username')} {ital('or')} {mono('123456789')}"),
+        "us_unban":     ("unban_wait",    "🕊 UNBAN USER",
+                         f"{bold('➤ Send the user:')} {mono('@username')} {ital('or')} {mono('123456789')}"),
+        "us_coins_add": ("coins_wait",    "➕ ADD COINS",
+                         f"{bold('➤ Send:')} {mono('@user +5')} {ital('or')} {mono('123456789 +50')}"),
+        "us_coins_rem": ("coins_wait",    "➖ REMOVE COINS",
+                         f"{bold('➤ Send:')} {mono('@user -3')} {ital('or')} {mono('123456789 -10')}"),
+    }
+    step, title, hint = mapping[c.data]
+    STATES[c.from_user.id] = {"step": step}
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(
+        frame(f"\n {title}\n") + f"\n{hint}\n",
+        c.message.chat.id, c.message.message_id, reply_markup=cancel_kb())
+
+def resolve_user(text):
+    """resolve @username or numeric id -> user row or None"""
+    t = text.strip()
+    if t.startswith("@"):
+        return get_user_by_username(t)
+    if t.isdigit():
+        return get_user(int(t))
+    return None
+
+# ───────────────── 📣 BROADCAST (BUTTONS) ─────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "ap_bc")
+async def cb_bc(c):
+    if not guard(c): return
+    STATES[c.from_user.id] = {"step": "bc_wait"}
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(
+        frame(f"\n 📣 {bold('BROADCAST TO ALL USERS')}\n") +
+        f"\n{bold('➤ Now send or FORWARD')} the message you want\nto deliver to ALL users. 📨\n"
+        f"{ital('(text, photo, video... anything!)')}\n",
+        c.message.chat.id, c.message.message_id, reply_markup=cancel_kb())
+
+@bot.callback_query_handler(func=lambda c: c.data == "bc_go")
+async def cb_bc_go(c):
+    if not guard(c): return
+    st = STATES.get(c.from_user.id)
+    if not st or st["step"] != "bc_confirm":
+        return await bot.answer_callback_query(c.id, "⚠️ Expired! Start again.", show_alert=True)
+    chat_id, msg_id = st["data"]["chat_id"], st["data"]["msg_id"]
+    STATES.pop(c.from_user.id, None)
+    await bot.answer_callback_query(c.id, "📣 Broadcasting...")
+    users = q("SELECT user_id FROM users WHERE banned=0").fetchall()
+    ok = fail = 0
+    status = await bot.send_message(c.from_user.id, f"📣 {bold('Broadcasting...')} ⏳")
+    for u in users:
+        try:
+            await bot.copy_message(u["user_id"], chat_id, msg_id)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)   # anti-flood
+    await bot.send_message(c.from_user.id,
+        frame(f"\n 📣 {bold('BROADCAST DONE')}\n") +
+        f"\n✅ {bold('Delivered:')} {bold(ok)}\n❌ {bold('Failed:')} {bold(fail)}\n👤 {bold('Total:')} {bold(len(users))}",
+        reply_markup=back_kb())
+    try:
+        await bot.delete_message(c.from_user.id, status.message_id)
+    except Exception:
+        pass
+
+@bot.callback_query_handler(func=lambda c: c.data == "bc_no")
+async def cb_bc_no(c):
+    if not guard(c): return
+    STATES.pop(c.from_user.id, None)
+    await bot.answer_callback_query(c.id, "❌ Broadcast cancelled")
+    await bot.edit_message_text(admin_panel_text(), c.message.chat.id,
+                                c.message.message_id, reply_markup=admin_panel_kb())
+
+# ───────────────── 📊 STATS ─────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "ap_stats")
+async def cb_stats(c):
+    if not guard(c): return
+    users  = q("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    banned = q("SELECT COUNT(*) c FROM users WHERE banned=1").fetchone()["c"]
+    gifts  = q("SELECT COUNT(*) c FROM gifts WHERE active=1").fetchone()["c"]
+    coins  = q("SELECT COALESCE(SUM(coins),0) c FROM users").fetchone()["c"]
+    entries= q("SELECT COUNT(*) c FROM entries").fetchone()["c"]
+    await bot.answer_callback_query(c.id)
+    await bot.edit_message_text(
+        frame(f"\n 📊 {bold('LIVE STATISTICS')}\n") +
+        f"\n👤 {bold('Users:')}        {bold(users)}\n"
+        f"🚫 {bold('Banned:')}       {bold(banned)}\n"
+        f"🎁 {bold('Active gifts:')} {bold(gifts)}\n"
+        f"🎟 {bold('Total entries:')} {bold(entries)}\n"
+        f"💎 {bold('Coins in circulation:')} 🔷 {bold(coins)}\n",
+        c.message.chat.id, c.message.message_id, reply_markup=back_kb())
+
+# ════════════════════════════════════════════════════════════════
+#               ADMIN TEXT HANDLER (STATE MACHINE)
+# ════════════════════════════════════════════════════════════════
+@bot.message_handler(content_types=["text", "forward_date"],
+                     func=lambda m: is_admin(m.from_user.id) and m.from_user.id in STATES)
+async def admin_state(m):
+    st = STATES[m.from_user.id]
+    step, data = st["step"], st.get("data", {})
+
+    # ── Gift creation ──
+    if step == "ng_title":
+        if not m.text: return
+        data["title"] = m.text.strip()
+        st["data"], st["step"] = data, "ng_cost"
+        return await bot.reply_to(m,
+            f"✅ {bold('Title saved:')} {bold(esc(data['title']))}\n\n"
+            f"💰 {bold('STEP 2/3')} — {ital('Join cost in coins (1–1000):')}\n"
+            f"{ital('e.g:')} {mono('3')}", reply_markup=cancel_kb())
+
+    if step == "ng_cost":
+        if not m.text or not m.text.strip().isdigit() or not (1 <= int(m.text) <= 1000):
+            return await bot.reply_to(m, f"⚠️ {bold('Send a number between 1 and 1000!')}")
+        data["cost"] = int(m.text)
+        st["data"], st["step"] = data, "ng_hours"
+        return await bot.reply_to(m,
+            f"✅ {bold('Cost:')} 🔷 {bold(data['cost'])} coins\n\n"
+            f"⏰ {bold('STEP 3/3')} — {ital('Duration in hours:')}\n"
+            f"{ital('e.g:')} {mono('12')}", reply_markup=cancel_kb())
+
+    if step == "ng_hours":
+        if not m.text or not m.text.strip().isdigit() or int(m.text) < 1:
+            return await bot.reply_to(m, f"⚠️ {bold('Send a valid number of hours!')}")
+        data["hours"] = int(m.text)
+        STATES.pop(m.from_user.id)
+        end_time = int(time.time()) + data["hours"] * 3600
+        cur = q("INSERT INTO gifts(title, cost, hours, end_time, active) VALUES(?,?,?,?,1)",
+                data["title"], data["cost"], data["hours"], end_time)
+        gid = cur.lastrowid
+        await bot.reply_to(m,
+            frame(f"\n ✅ {bold('GIFT CREATED!')}\n") +
+            f"\n🆔 {mono(gid)}\n🎁 {bold(esc(data['title']))}\n"
+            f"💰 Cost: 🔷 {bold(data['cost'])}\n⏰ Duration: {bold(data['hours'])} hours",
+            reply_markup=back_kb())
+        await post_gift(gid)
+        return
+
+    # ── Force-join add ──
+    if step == "fj_add":
+        chat = m.forward_from_chat
+        if not chat and m.text and m.text.strip():
+            try:
+                chat = await bot.get_chat(m.text.strip())
+            except Exception:
+                chat = None
+        if not chat or chat.type not in ("channel", "group", "supergroup"):
+            return await bot.reply_to(m, f"❌ {bold('Cannot access that chat!')}\n"
+                                         f"{ital('Add the bot there first & try again.')}")
+        q("INSERT OR REPLACE INTO channels(channel_id, title, username) VALUES(?,?,?)",
+          chat.id, chat.title, chat.username)
+        STATES.pop(m.from_user.id)
+        return await bot.reply_to(m,
+            frame(f"\n ✅ {bold('FORCE-JOIN ADDED')}\n") +
+            f"\n📢 {bold(esc(chat.title))}\n🆔 {mono(chat.id)}\n\n"
+            f"{ital('All users must join before participating!')} 🔒",
+            reply_markup=back_kb())
+
+    # ── Announce targets ──
+    if step in ("set_chan", "set_grp"):
+        return await _set_announce(m,
+            "announce_channel" if step == "set_chan" else "announce_group",
+            "CHANNEL" if step == "set_chan" else "GROUP")
+
+    # ── Ban / Unban ──
+    if step in ("ban_wait", "unban_wait"):
+        if not m.text: return
+        u = resolve_user(m.text)
+        if not u:
+            return await bot.reply_to(m, f"❌ {bold('User not found in database!')}")
+        banning = step == "ban_wait"
+        if banning and u["user_id"] in ADMIN_IDS:
+            return await bot.reply_to(m, f"⚠️ {bold('You cannot ban an admin!')} 😅")
+        q("UPDATE users SET banned=? WHERE user_id=?", 1 if banning else 0, u["user_id"])
+        STATES.pop(m.from_user.id)
+        return await bot.reply_to(m,
+            frame(f"\n {'🔨 BANNED' if banning else '🕊 UNBANNED'}\n") +
+            f"\n👤 {bold(esc(u['username'] or u['user_id']))}\n"
+            f"🆔 {mono(u['user_id'])}",
+            reply_markup=back_kb())
+
+    # ── Coins ──
+    if step == "coins_wait":
+        if not m.text: return
+        parts = m.text.split()
+        if len(parts) != 2 or not re.match(r"^[+-]?\d+$", parts[1]):
+            return await bot.reply_to(m,
+                f"⚠️ {bold('Wrong format!')} {ital('Send like:')} {mono('@user +5')}")
+        u = resolve_user(parts[0])
+        if not u:
+            return await bot.reply_to(m, f"❌ {bold('User not found in database!')}")
+        amount = int(parts[1])
+        add_coins(u["user_id"], amount)
+        STATES.pop(m.from_user.id)
+        return await bot.reply_to(m,
+            frame(f"\n 💎 {bold('COINS UPDATED')}\n") +
+            f"\n👤 {bold(esc(u['username'] or u['user_id']))}\n"
+            f"{'➕' if amount >= 0 else '➖'} Amount: 🔷 {bold(abs(amount))}\n"
+            f"💎 New balance: 🔷 {bold(get_user(u['user_id'])['coins'])}",
+            reply_markup=back_kb())
+
+    # ── Broadcast preview ──
+    if step == "bc_wait":
+        STATES[m.from_user.id] = {"step": "bc_confirm",
+                                  "data": {"chat_id": m.chat.id, "msg_id": m.message_id}}
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton(f"🚀 {bold('SEND IT!')}", callback_data="bc_go"),
+            types.InlineKeyboardButton(f"❌ {bold('CANCEL')}",   callback_data="bc_no"),
+        )
+        return await bot.reply_to(m,
+            f"👀 {bold('PREVIEW ABOVE')} ⬆️\n\n"
+            f"{ital('This message will be sent to ALL users. Confirm?')} 📣",
+            reply_markup=kb)
+
+# ════════════════════════════════════════════════════════════════
+#                        USER SIDE
+# ════════════════════════════════════════════════════════════════
+@bot.message_handler(commands=["start"])
+async def cmd_start(m):
+    global BOT_USERNAME
+    if not m.from_user: return
+    u, created = ensure_user(m.from_user.id, m.from_user.username)
+    if u["banned"]:
+        return await bot.reply_to(m, frame(f"\n 🚫 {bold('YOU ARE BANNED!')}"))
+
+    ref_id = None
+    if len(m.text.split()) > 1 and m.text.split()[1].startswith("ref_"):
+        try: ref_id = int(m.text.split()[1][4:])
+        except ValueError: ref_id = None
+
+    if created and ref_id and ref_id != m.from_user.id:
+        referrer = get_user(ref_id)
+        if referrer and not referrer["banned"]:
+            q("UPDATE users SET referrer=? WHERE user_id=?", ref_id, m.from_user.id)
+
+    miss = await missing_channels(m.from_user.id)
+    if miss:
+        return await bot.reply_to(m,
+            frame(f"\n 🔒 {bold('JOIN REQUIRED')} 🔒\n") +
+            f"\n{bold('➤ Join these channels first to use the bot:')}\n",
+            reply_markup=join_kb(miss))
+
+    await maybe_reward_referral(m.from_user.id)
+
+    kb = user_panel_kb()
+    if is_admin(m.from_user.id):
+        kb.add(types.InlineKeyboardButton(f"🛡 {bold('ADMIN PANEL')}", callback_data="ap"))
+    await bot.reply_to(m, user_text(u), reply_markup=kb)
+
+async def maybe_reward_referral(uid):
+    u = get_user(uid)
+    if not u or not u["referrer"]: return False
+    referrer = get_user(u["referrer"])
+    if not referrer or referrer["banned"]: return False
+    add_coins(uid, 1)
+    add_coins(referrer, 3)
+    q("UPDATE users SET referrer=NULL WHERE user_id=?", uid)
+    try:
+        await bot.send_message(uid,
+            f"🎁 {bold('Welcome!')} You got 🔷 {bold(1)} coin for joining!\n"
+            f"👑 {bold('Referral reward sent to your inviter!')}")
+    except Exception: pass
+    try:
+        await bot.send_message(u["referrer"],
+            f"🎉 {bold('New Referral!')} 👥\n"
+            f"💎 You earned 🔷 {bold(3)} coins!\n"
+            f"💎 New balance: 🔷 {bold(get_user(u['referrer'])['coins'])}")
+    except Exception: pass
+    return True
+
+@bot.callback_query_handler(func=lambda c: c.data == "recheck")
+async def cb_recheck(c):
+    miss = await missing_channels(c.from_user.id)
+    if miss:
+        return await bot.answer_callback_query(c.id, "❌ You have NOT joined all channels!", show_alert=True)
+    await maybe_reward_referral(c.from_user.id)
+    u = get_user(c.from_user.id)
+    await bot.answer_callback_query(c.id, "✅ Verified!")
+    kb = user_panel_kb()
+    if is_admin(c.from_user.id):
+        kb.add(types.InlineKeyboardButton(f"🛡 {bold('ADMIN PANEL')}", callback_data="ap"))
+    await bot.send_message(c.from_user.id, user_text(dict(u)), reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data == "noop")
+async def cb_noop(c):
+    await bot.answer_callback_query(c.id, "⚠️ No link available — ask admin!")
+
+@bot.callback_query_handler(func=lambda c: c.data == "balance")
+async def cb_balance(c):
+    u = get_user(c.from_user.id)
+    if u and u["banned"]:
+        return await bot.answer_callback_query(c.id, "🚫 You are banned!")
+    await bot.answer_callback_query(c.id)
+    await bot.send_message(c.from_user.id,
+        frame(f"\n 💎 {bold('YOUR BALANCE')}\n") +
+        f"\n{bold('➤ Coins:')}  🔷 {bold(u['coins'])}\n\n"
+        f"{ital('Earn more: daily bonus + referrals!')} 🍀")
+
+@bot.callback_query_handler(func=lambda c: c.data == "daily")
+async def cb_daily(c):
+    u = get_user(c.from_user.id)
+    if u and u["banned"]:
+        return await bot.answer_callback_query(c.id, "🚫 You are banned!")
+    today = datetime.date.today().isoformat()
+    if u["last_daily"] == today:
+        return await bot.answer_callback_query(c.id, "⏳ Already claimed today! Come back tomorrow.", show_alert=True)
+    add_coins(c.from_user.id, 1)
+    q("UPDATE users SET last_daily=? WHERE user_id=?", today, c.from_user.id)
+    await bot.answer_callback_query(c.id, "🎁 +1 Coin claimed!")
+    await bot.send_message(c.from_user.id,
+        frame(f"\n 🎯 {bold('DAILY BONUS CLAIMED')}\n") +
+        f"\n💎 Reward:  🔷 {bold(1)} coin\n"
+        f"💎 Balance:  🔷 {bold(get_user(c.from_user.id)['coins'])}")
+
+@bot.callback_query_handler(func=lambda c: c.data == "ref")
+async def cb_ref(c):
+    u = get_user(c.from_user.id)
+    if u and u["banned"]:
+        return await bot.answer_callback_query(c.id, "🚫 You are banned!")
+    count = q("SELECT COUNT(*) c FROM users WHERE referrer=?", c.from_user.id).fetchone()["c"]
+    link = f"https://t.me/{BOT_USERNAME}?start=ref_{c.from_user.id}"
+    await bot.answer_callback_query(c.id)
+    await bot.send_message(c.from_user.id,
+        frame(f"\n 👥 {bold('REFERRAL SYSTEM')}\n") +
+        f"\n{bold('➤ Invited users:')}  👤 {bold(count)}\n"
+        f"{bold('➤ Per referral:')}  🔷 {bold('+1')} you / 🔷 {bold('+3')} inviter\n\n"
+        f"{ital('Share your link:')} 👇\n{mono(link)}")
+
+@bot.callback_query_handler(func=lambda c: c.data == "gifts_list")
+async def cb_gifts_list(c):
+    u = get_user(c.from_user.id)
+    if u and u["banned"]:
+        return await bot.answer_callback_query(c.id, "🚫 You are banned!")
+    gifts = q("SELECT * FROM gifts WHERE active=1 ORDER BY end_time").fetchall()
+    await bot.answer_callback_query(c.id)
+    if not gifts:
+        return await bot.send_message(c.from_user.id,
+            frame(f"\n 🎁 {bold('ACTIVE GIVEAWAYS')}\n") +
+            f"\n{ital('No active giveaways right now... stay tuned!')} ⏳")
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    txt = frame(f"\n 🎁 {bold('ACTIVE GIVEAWAYS')}\n") + "\n"
+    for g in gifts:
+        left = int((g["end_time"] - time.time()) // 3600) + 1
+        joined = q("SELECT COUNT(*) c FROM entries WHERE gift_id=?", g["id"]).fetchone()["c"]
+        txt += (f"\n🆔 {mono(g['id'])} | 🎁 {bold(esc(g['title']))}\n"
+                f"   💰 Cost: 🔷 {bold(g['cost'])}  |  ⏰ {bold(left)}h left\n"
+                f"   👥 Participants: {bold(joined)}\n")
+        kb.add(types.InlineKeyboardButton(
+            f"🔴 JOIN  #{g['id']} — {g['title'][:22]}", callback_data=f"join_{g['id']}"))
+    await bot.send_message(c.from_user.id, txt, reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("join_"))
+async def cb_join(c):
+    gid = int(c.data.split("_")[1])
+    u = get_user(c.from_user.id)
+    if not u or u["banned"]:
+        return await bot.answer_callback_query(c.id, "🚫 You are banned!", show_alert=True)
+    g = q("SELECT * FROM gifts WHERE id=? AND active=1", gid).fetchone()
+    if not g:
+        return await bot.answer_callback_query(c.id, "❌ This giveaway is over!", show_alert=True)
+    miss = await missing_channels(c.from_user.id)
+    if miss:
+        await bot.answer_callback_query(c.id, "🔒 Join required channels first!", show_alert=True)
+        return await bot.send_message(c.from_user.id, bold("🔒 Join these first:"),
+                                      reply_markup=join_kb(miss))
+    if q("SELECT 1 FROM entries WHERE gift_id=? AND user_id=?", gid, c.from_user.id).fetchone():
+        return await bot.answer_callback_query(c.id, "✋ You already joined this giveaway!", show_alert=True)
+    if u["coins"] < g["cost"]:
+        return await bot.answer_callback_query(
+            c.id, f"❌ Not enough coins! Need 🔷{g['cost']}, you have 🔷{u['coins']}", show_alert=True)
+    add_coins(c.from_user.id, -g["cost"])
+    q("INSERT INTO entries(gift_id, user_id) VALUES(?,?)", gid, c.from_user.id)
+    joined = q("SELECT COUNT(*) c FROM entries WHERE gift_id=?", gid).fetchone()["c"]
+    await bot.answer_callback_query(c.id, f"🎉 You joined! -{g['cost']} coins")
+    await bot.send_message(c.from_user.id,
+        frame(f"\n ✅ {bold('JOINED SUCCESSFULLY')}\n") +
+        f"\n🎁 {bold(esc(g['title']))}\n"
+        f"💎 Cost paid:  🔷 {bold(g['cost'])}\n"
+        f"👥 Participants:  {bold(joined)}\n"
+        f"🍀 {ital('Good luck! Winner announced when it ends!')}")
+    for mid, key in ((g["chan_msg_id"], "announce_channel"), (g["grp_msg_id"], "announce_group")):
+        ch = get_chat(key)
+        if mid and ch:
+            try:
+                await bot.edit_message_reply_markup(ch["chat_id"], mid,
+                    reply_markup=types.InlineKeyboardMarkup().add(
+                        types.InlineKeyboardButton(f"🔴 {bold('PARTICIPATE')}  👥 {joined}",
+                                                   callback_data=f"join_{gid}")))
+            except Exception:
+                pass
+
+# ───────────────────── POST & FINISH GIFT ───────────────────────
+async def post_gift(gid):
+    g = dict(q("SELECT * FROM gifts WHERE id=?", gid).fetchone())
+    joined = q("SELECT COUNT(*) c FROM entries WHERE gift_id=?", gid).fetchone()["c"]
+    end = datetime.datetime.fromtimestamp(g["end_time"]).strftime("%H:%M • %d %b %Y")
+    txt = frame(f"\n 🎉 {bold('NEW GIVEAWAY')} 🎉\n") + \
+        f"\n🎁 {bold('Prize:')}  {bold(esc(g['title']))}\n" \
+        f"💰 {bold('Join Cost:')}  🔷 {bold(g['cost'])} coins\n" \
+        f"⏰ {bold('Ends at:')}  {bold(end)}  ({bold(g['hours'])}h)\n" \
+        f"👥 {bold('Participants:')}  {bold(joined)}\n\n" \
+        f"{ital('Tap the button below to join!')} 🍀"
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(
+        f"🔴 {bold('PARTICIPATE')}  👥 {joined}", callback_data=f"join_{gid}"))
+    for key in ("announce_channel", "announce_group"):
+        ch = get_chat(key)
+        if ch:
+            try:
+                msg = await bot.send_message(ch["chat_id"], txt, reply_markup=kb)
+                col = "chan_msg_id" if key == "announce_channel" else "grp_msg_id"
+                q(f"UPDATE gifts SET {col}=? WHERE id=?", msg.message_id, gid)
+            except Exception as e:
+                print("post_gift err:", e)
+
+async def finish_gift(g):
+    q("UPDATE gifts SET active=0 WHERE id=?", g["id"])
+    entries = q("SELECT * FROM entries WHERE gift_id=?", g["id"]).fetchall()
+    body = frame(f"\n ⏰ {bold('GIVEAWAY ENDED')}\n") + \
+        f"\n🎁 {bold(esc(g['title']))}\n👥 Participants: {bold(len(entries))}\n"
+    if not entries:
+        body += f"\n{ital('Unfortunately, nobody joined.')} 😔"
+    else:
+        winner = random.choice(entries)
+        wu = get_user(winner["user_id"])
+        mention = (f"@{wu['username']}" if wu and wu["username"]
+                   else f'<a href="tg://user?id={winner["user_id"]}">User</a>')
+        body += (f"\n🏆 {bold('WINNER:')}  👑 {mention}\n\n"
+                 f"🎊 {bold('Congratulations!')} Contact the admins to claim your prize! 🎊")
+        try:
+            await bot.send_message(winner["user_id"],
+                frame(f"\n 🏆 {bold('YOU WON!')} 🏆\n") +
+                f"\n🎁 {bold(esc(g['title']))}\n"
+                f"👑 {ital('You are the lucky winner!')}\n"
+                f"{ital('Contact the admins to claim your prize!')} 🎊")
+        except Exception: pass
+    chan, grp = get_chat("announce_channel"), get_chat("announce_group")
+    if chan:
+        try: await bot.send_message(chan["chat_id"], body)
+        except Exception: pass
+    if grp:
+        try:
+            msg = await bot.send_message(grp["chat_id"], body)
+            await bot.pin_chat_message(grp["chat_id"], msg.message_id, disable_notification=False)
+        except Exception: pass
+    q("DELETE FROM gifts WHERE id=?", g["id"])
+    q("DELETE FROM entries WHERE gift_id=?", g["id"])
+
+async def scheduler():
+    while True:
+        try:
+            rows = q("SELECT * FROM gifts WHERE active=1 AND end_time<=?", int(time.time())).fetchall()
+            for g in rows:
+                await finish_gift(dict(g))
+        except Exception as e:
+            print("scheduler error:", e)
+        await asyncio.sleep(15)
+
+# ─────────────────────────── MAIN ───────────────────────────────
+async def main():
+    global BOT_USERNAME
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+    await bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(scheduler())
+    print("✦ X GIFT BOT IS RUNNING ✦")
+    await bot.infinity_polling(timeout=30, request_timeout=35)
+
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise SystemExit("❌ Set BOT_TOKEN environment variable!")
+    asyncio.run(main())
