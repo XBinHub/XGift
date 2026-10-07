@@ -881,4 +881,4 @@ if __name__ == "__main__":
     BOT_USERNAME = me.username
     threading.Thread(target=scheduler, daemon=True).start()
     print("✦ X GIFT BOT IS RUNNING ✦")
-    bot.infinity_polling(timeout=30, request_timeout=35, skip_pending=True)
+    bot.infinity_polling(timeout=30, long_polling_timeout=35, skip_pending=True)
